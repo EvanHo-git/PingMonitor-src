@@ -155,8 +155,15 @@ def run_selftest() -> int:
     started = time.strftime("%Y-%m-%d %H:%M:%S")
 
     def log(msg):
-        print(msg)
         lines.append(msg)
+        # --windowed 在 headless 环境（如 CI runner）下 sys.stdout 为 None，
+        # 直接 print 会抛异常；stdout 不可用时静默丢弃，真实记录以落盘报告为准。
+        try:
+            if sys.stdout is not None:
+                sys.stdout.write(msg + "\n")
+        except Exception:  # noqa: BLE001
+            pass
+   
 
     log("=" * 60)
     log(f"PingMonitor 自检  started={started}  platform={sys.platform}  python={sys.version.split()[0]}")
