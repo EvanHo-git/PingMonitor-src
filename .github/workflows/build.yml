@@ -5,9 +5,14 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,3 +36,15 @@ jobs:
           name: PingMonitor-windows-exe
           path: dist/PingMonitor.exe
           if-no-files-found: error
+
+      - name: Attach exe to release
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        run: |
+          if (gh release view NetworkTools) {
+            gh release upload NetworkTools dist/PingMonitor.exe --clobber
+          } else {
+            gh release create NetworkTools dist/PingMonitor.exe --title "PingMonitor-src_V1.0" --latest
+          }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
