@@ -2,9 +2,8 @@
 
 面向网络管理员的批量 Ping 探测与实时质量监测桌面工具。零第三方运行时依赖，双击即运行。
 
-- **macOS 版**：`PingMonitor.app`（本机 PyInstaller 打包 + ad-hoc 自签名）
-- **Windows 版**：`PingMonitor.exe`（GitHub Actions 云端构建，单文件）
-
+- **macOS 版**：`PingMonitor.app`
+- **Windows 版**：`PingMonitor.exe`
 ---
 
 ## 一、功能
