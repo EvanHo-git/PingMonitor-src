@@ -27,6 +27,12 @@ class ProbeScheduler:
         self._executor = None
         self._futures = []
         self.running = False
+        # 热添加支持：_started 记录已提交过探测循环的 host；
+        # _gen_of 记录每个 host 当前有效的循环代次，代次失效的循环会自行退出
+        self._started = set()
+        self._gen_of = {}
+        self._gen = 0
+        self._gen_lock = threading.Lock()
 
     # ---------- 生命周期 ----------
     def start(self):
@@ -38,8 +44,17 @@ class ProbeScheduler:
         self._stop.clear()
         self._pause.clear()
         self.running = True
-        self._executor = ThreadPoolExecutor(max_workers=self.params.concurrency)
-        self._futures = [self._executor.submit(self._loop, t) for t in enabled]
+        # 线程数必须覆盖全部目标：每个循环长期占用一个线程，
+        # 若只按 concurrency 建池，多出的目标会一直排队、永远不被探测。
+        workers = max(int(self.params.concurrency), len(enabled))
+        self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._started = set()
+        self._gen_of = {}
+        self._futures = []
+        for t in enabled:
+            self._started.add(t.host)
+            self._gen_of[t.host] = self._gen
+            self._futures.append(self._executor.submit(self._loop, t, self._gen))
 
     def stop(self, wait: bool = True):
         self.running = False
@@ -50,6 +65,8 @@ class ProbeScheduler:
             self._executor.shutdown(wait=wait, cancel_futures=True)
             self._executor = None
         self._futures = []
+        self._started = set()
+        self._gen_of = {}
 
     def set_paused(self, paused: bool):
         if paused:
@@ -66,9 +83,53 @@ class ProbeScheduler:
         self.params = params
 
     def set_targets(self, targets):
+        """更新目标清单（支持运行中热添加）。
+
+        - 新增目标：立即提交探测循环，下一轮即纳入监测；
+        - 移除/停用的目标：由 _loop 每轮的 _is_active() 自检退出，不再产生数据；
+        - 目标数超过线程池容量时：重建线程池并整体重新提交（旧循环按代次失效退出）。
+        """
         self.targets = list(targets)
+        if not self.running or self._executor is None:
+            return
+        enabled = [t for t in self.targets if t.enabled]
+        alive = {t.host for t in enabled}
+        # 已移除的目标允许重新加入：清掉其"已启动"标记
+        self._started &= alive
+        added = [t for t in enabled if t.host not in self._started]
+        if len(enabled) > self._executor._max_workers:
+            self._rebuild_executor(enabled, len(enabled))
+            return
+        if not added:
+            return          # 纯删除：无需提交，靠 _loop 自检回收线程
+        for t in added:
+            gen = self._next_gen()
+            self._started.add(t.host)
+            self._gen_of[t.host] = gen
+            self._futures.append(self._executor.submit(self._loop, t, gen))
 
     # ---------- 内部 ----------
+    def _next_gen(self) -> int:
+        with self._gen_lock:
+            self._gen += 1
+            return self._gen
+
+    def _rebuild_executor(self, enabled, workers: int):
+        """扩容重建线程池：旧池中的循环因代次失效，会在本轮探测后自行退出。"""
+        old = self._executor
+        self._executor = ThreadPoolExecutor(max_workers=workers)
+        self._futures = []
+        self._started = set()
+        self._gen_of = {}
+        for t in enabled:
+            gen = self._next_gen()
+            self._started.add(t.host)
+            self._gen_of[t.host] = gen
+            self._futures.append(self._executor.submit(self._loop, t, gen))
+        if old is not None:
+            # 旧池不再接收新任务；其线程跑完当前探测即退出，不阻塞调用方
+            threading.Thread(target=old.shutdown, kwargs={"wait": False},
+                             daemon=True).start()
     def _kill_all(self):
         with self._proc_lock:
             procs = list(self._procs)
@@ -79,16 +140,28 @@ class ProbeScheduler:
             except Exception:
                 pass
 
-    def _loop(self, target: TargetConfig):
+    def _is_active(self, host: str, gen: int) -> bool:
+        """本循环是否仍然有效：代次未变，且目标仍在清单中并处于启用状态。"""
+        if self._stop.is_set():
+            return False
+        if self._gen_of.get(host) != gen:
+            return False
+        return any(t.host == host and t.enabled for t in self.targets)
+
+    def _loop(self, target: TargetConfig, gen: int):
+        host = target.host
         idx = 1
         while not self._stop.is_set():
+            if not self._is_active(host, gen):
+                break                       # 目标被删除/停用/重建 → 回收线程
             if self._pause.is_set():
                 if self._stop.wait(0.2):
                     break
                 continue
             res = run_probe(self.params, target, idx,
                             platform=self.platform, proc_registry=self._procs)
-            if self._stop.is_set():
+            # 探测期间目标可能已被删除或重建：失效循环的结果丢弃，避免脏数据
+            if self._stop.is_set() or not self._is_active(host, gen):
                 break
             try:
                 self.on_result(res)

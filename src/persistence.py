@@ -35,10 +35,50 @@ def theme_path() -> str:
     return os.path.join(user_data_dir(), "theme.json")
 
 
+def view_path() -> str:
+    return os.path.join(user_data_dir(), "view.json")
+
+
+VALID_VIEWS = ("overlay", "grid")
+
+
+def load_view(default: str = "grid") -> str:
+    """读取上次的结果视图；无记录时返回 default（首次使用为网格小图）。"""
+    path = view_path()
+    if not os.path.isfile(path):
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            v = json.load(f).get("view", default)
+        return v if v in VALID_VIEWS else default
+    except (OSError, ValueError):
+        return default
+
+
+def save_view(view: str):
+    if view not in VALID_VIEWS:
+        return
+    _atomic_write(view_path(), json.dumps({"view": view}, ensure_ascii=False, indent=2))
+
+
+# 首次启动的预设目标（仅当 targets.json 不存在时注入）
+DEFAULT_TARGETS = (
+    ("www.baidu.com", "百度"),
+    ("8.8.8.8", "Google DNS"),
+)
+
+
+def default_targets():
+    """首次启动的预设目标：www.baidu.com 与 8.8.8.8。"""
+    return [TargetConfig(name=name, host=host) for host, name in DEFAULT_TARGETS]
+
+
 def load_targets():
     path = targets_path()
     if not os.path.isfile(path):
-        return []
+        # 首次使用：注入两个预设目标，避免空列表无从下手。
+        # 注意：文件存在但为空数组时按空处理，尊重用户"删空"的结果，不再重新注入。
+        return default_targets()
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -151,21 +191,29 @@ def _looks_like_host(s: str) -> bool:
 
 
 # ---------------- 导出 ----------------
-def default_export_name(ext: str) -> str:
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    return os.path.join(export_dir(), f"ping_{stamp}.{ext}")
+def default_export_name(ext: str, start_ts: float = None) -> str:
+    """默认文件名统一为「日志」语义（扩展名仍决定真实格式）。
+
+    优先用监测会话的开始时间戳，便于按事件归档；缺省则用导出时间。
+    """
+    ts = start_ts if start_ts else time.time()
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(ts))
+    return os.path.join(export_dir(), f"pinglog_{stamp}.{ext}")
 
 
 def _fmt(v):
     return "" if v is None else f"{v:.3f}"
 
 
-def export_csv(results, path: str = None) -> str:
-    path = path or default_export_name("csv")
+def export_csv(results, path: str = None, start_ts: float = None) -> str:
+    path = path or default_export_name("csv", start_ts)
     # utf-8-sig：Excel 打开中文不乱码
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
         w.writerow(["# " + CSV_NOTE])
+        if start_ts:
+            w.writerow(["# 监测开始时间：",
+                        time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(start_ts))])
         w.writerow(CSV_HEADER)
         for r in results:
             w.writerow([
@@ -178,10 +226,16 @@ def export_csv(results, path: str = None) -> str:
     return path
 
 
-def export_json(results, path: str = None) -> str:
-    path = path or default_export_name("json")
+def export_json(results, path: str = None, host: dict = None,
+                start_ts: float = None) -> str:
+    """F7: 头部携带本机信息与会话开始时间，便于复盘定位。"""
+    path = path or default_export_name("json", start_ts)
     payload = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "session_start": (time.strftime("%Y-%m-%d %H:%M:%S",
+                                        time.localtime(start_ts))
+                          if start_ts else None),
+        "host": host or {},
         "metrics_note": CSV_NOTE,
         "count": len(results),
         "records": [r.to_row() for r in results],
